@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Amazon.DynamoDBv2;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace DynamoLock.Tests
@@ -10,33 +11,42 @@ namespace DynamoLock.Tests
     [Collection("DynamoDb collection")]
     public class DynamoDbLockerManagerTests
     {
-        DynamoDbDockerSetup _dockerSetup;
-        private IDistributedLockManager _subject;
-        private TimeSpan _heartbeat = TimeSpan.FromSeconds(2);
-        private long _leaseTime = 3;
+        private readonly DynamoDbDockerSetup _dockerSetup;
+        private readonly IDistributedLockManager _subject;
+        private readonly TimeSpan _heartbeat = TimeSpan.FromSeconds(2);
+        private readonly TimeSpan _leaseTime = TimeSpan.FromSeconds(3);
 
         public DynamoDbLockerManagerTests(DynamoDbDockerSetup dockerSetup)
         {
             _dockerSetup = dockerSetup;
             var cfg = new AmazonDynamoDBConfig { ServiceURL = DynamoDbDockerSetup.ConnectionString };
-            var provisioner = new LockTableProvisioner(DynamoDbDockerSetup.Credentials, cfg, "lock-tests", new NullLoggerFactory());
-            var tracker = new LocalLockTracker();
-            var heartbeatDispatcher = new HeartbeatDispatcher(DynamoDbDockerSetup.Credentials, cfg, tracker, "lock-tests", new NullLoggerFactory());
-            _subject = new DynamoDbLockManager(DynamoDbDockerSetup.Credentials, cfg, "lock-tests", provisioner, heartbeatDispatcher, tracker, new NullLoggerFactory(), _leaseTime, _heartbeat);
+            var client = new AmazonDynamoDBClient(DynamoDbDockerSetup.Credentials, cfg);
+
+            var options = Options.Create(new DynamoDbLockOptions
+            {
+                TableName = "lock-tests",
+                LeaseTime = _leaseTime,
+                HeartbeatInterval = _heartbeat,
+            });
+            _subject = new DynamoDbLockManager(client, options, new NullLoggerFactory());
         }
-        
+
         [Fact]
         public async void should_lock_resource()
         {
             var lockId = Guid.NewGuid().ToString();
 
-            await _subject.Start();
-            var first = await _subject.AcquireLock(lockId);
-            var second = await _subject.AcquireLock(lockId);
-            await _subject.Stop();
+            using var cts = new CancellationTokenSource();
+            var task = _subject.ExecuteAsync(cts.Token);
 
-            Assert.True(first);
-            Assert.False(second);
+            var first = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+            var second = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+
+            cts.Cancel();
+            await task;
+
+            Assert.True(first.Acquired);
+            Assert.False(second.Acquired);
         }
 
         [Fact]
@@ -44,14 +54,18 @@ namespace DynamoLock.Tests
         {
             var lockId = Guid.NewGuid().ToString();
 
-            await _subject.Start();
-            var first = await _subject.AcquireLock(lockId);
-            await _subject.ReleaseLock(lockId);
-            var second = await _subject.AcquireLock(lockId);
-            await _subject.Stop();
+            using var cts = new CancellationTokenSource();
+            var task = _subject.ExecuteAsync(cts.Token);
 
-            Assert.True(first);
-            Assert.True(second);
+            var first = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+            await first.ReleaseLockAsync(CancellationToken.None);
+            var second = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+
+            cts.Cancel();
+            await task;
+
+            Assert.True(first.Acquired);
+            Assert.True(second.Acquired);
         }
 
         [Fact]
@@ -59,14 +73,18 @@ namespace DynamoLock.Tests
         {
             var lockId = Guid.NewGuid().ToString();
 
-            await _subject.Start();
-            var first = await _subject.AcquireLock(lockId);
-            await Task.Delay(TimeSpan.FromSeconds(_leaseTime + 2));
-            var second = await _subject.AcquireLock(lockId);
-            await _subject.Stop();
+            using var cts = new CancellationTokenSource();
+            var task = _subject.ExecuteAsync(cts.Token);
 
-            Assert.True(first);
-            Assert.False(second);
+            var first = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+            await Task.Delay(_leaseTime + TimeSpan.FromSeconds(2));
+            var second = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+
+            cts.Cancel();
+            await task;
+
+            Assert.True(first.Acquired);
+            Assert.False(second.Acquired);
         }
 
         [Fact]
@@ -74,16 +92,25 @@ namespace DynamoLock.Tests
         {
             var lockId = Guid.NewGuid().ToString();
 
-            await _subject.Start();
-            var first = await _subject.AcquireLock(lockId);
-            await _subject.Stop();
-            await Task.Delay(TimeSpan.FromSeconds(_leaseTime + 2));
-            await _subject.Start();
-            var second = await _subject.AcquireLock(lockId);
-            await _subject.Stop();
+            using var cts1 = new CancellationTokenSource();
+            var task = _subject.ExecuteAsync(cts1.Token);
 
-            Assert.True(first);
-            Assert.True(second);
+            var first = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+            cts1.Cancel();
+            await task;
+
+            await Task.Delay(_leaseTime + TimeSpan.FromSeconds(2));
+
+            using var cts2 = new CancellationTokenSource();
+            task = _subject.ExecuteAsync(cts2.Token);
+
+            var second = await _subject.AcquireLockAsync(lockId, CancellationToken.None);
+
+            cts2.Cancel();
+            await task;
+
+            Assert.True(first.Acquired);
+            Assert.True(second.Acquired);
         }
     }
 }

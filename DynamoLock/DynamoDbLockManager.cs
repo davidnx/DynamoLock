@@ -1,154 +1,174 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
-using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
-using Amazon.Runtime;
+using DynamoLock.Internals;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace DynamoLock
 {
     public class DynamoDbLockManager : IDistributedLockManager
     {
-        private readonly ILogger _logger;
         private readonly IAmazonDynamoDB _client;
+        private readonly DynamoDbLockOptions _options;
+
         private readonly ILockTableProvisioner _provisioner;
         private readonly IHeartbeatDispatcher _heartbeatDispatcher;
-        private readonly ILocalLockTracker _lockTracker;
-        private readonly string _tableName;
-        private readonly string _nodeId = Guid.NewGuid().ToString();
-        private readonly long _defaultLeaseTime = 30;
-        private readonly TimeSpan _heartbeat = TimeSpan.FromSeconds(10);
-        private readonly long _jitterTolerance = 1;
-        
+        private readonly LocalLockTracker _lockTracker;
 
-        public DynamoDbLockManager(AWSCredentials credentials, AmazonDynamoDBConfig config, string tableName, ILockTableProvisioner provisioner, IHeartbeatDispatcher heartbeatDispatcher, ILocalLockTracker lockTracker, ILoggerFactory logFactory)
+        private int _running;
+
+        public DynamoDbLockManager(
+            IAmazonDynamoDB client,
+            IOptions<DynamoDbLockOptions> options,
+            ILoggerFactory loggerFactory)
+            : this(
+                  client,
+                  options,
+                  new LockTableProvisioner(client, options, loggerFactory.CreateLogger<LockTableProvisioner>()),
+                  new HeartbeatDispatcher(client, options, loggerFactory.CreateLogger<HeartbeatDispatcher>()))
         {
-            _logger = logFactory.CreateLogger<DynamoDbLockManager>();
-            _client = new AmazonDynamoDBClient(credentials, config);
-            _tableName = tableName;
-            _provisioner = provisioner;
-            _heartbeatDispatcher = heartbeatDispatcher;
-            _lockTracker = lockTracker;
         }
 
-        public DynamoDbLockManager(AWSCredentials credentials, RegionEndpoint region, string tableName, ILoggerFactory logFactory)
+        /// <summary>
+        /// This is intended for unit tests.
+        /// </summary>
+        public DynamoDbLockManager(
+            IAmazonDynamoDB client,
+            IOptions<DynamoDbLockOptions> options,
+            ILockTableProvisioner provisioner,
+            IHeartbeatDispatcher heartbeatDispatcher)
         {
-            _logger = logFactory.CreateLogger<DynamoDbLockManager>();
-            _client = new AmazonDynamoDBClient(credentials, region);
-            _tableName = tableName;
+            _client = client ?? throw new ArgumentNullException(nameof(client));
+            _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+            _options.Validate();
+
+            _provisioner = provisioner ?? throw new ArgumentNullException(nameof(provisioner));
+            _heartbeatDispatcher = heartbeatDispatcher ?? throw new ArgumentNullException(nameof(heartbeatDispatcher));
             _lockTracker = new LocalLockTracker();
-            _provisioner = new LockTableProvisioner(credentials, new AmazonDynamoDBConfig() { RegionEndpoint = region }, tableName, logFactory);
-            _heartbeatDispatcher = new HeartbeatDispatcher(credentials, new AmazonDynamoDBConfig() {RegionEndpoint = region}, _lockTracker, tableName, logFactory);
         }
 
-        public DynamoDbLockManager(IAmazonDynamoDB dynamoClient, string tableName, ILoggerFactory logFactory)
+        public async Task<DistributedLockAcquisition> AcquireLockAsync(string lockId, CancellationToken cancellation)
         {
-            _logger = logFactory.CreateLogger<DynamoDbLockManager>();
-            _client = dynamoClient;
-            _tableName = tableName;
-            _lockTracker = new LocalLockTracker();
-            _provisioner = new LockTableProvisioner(dynamoClient, tableName, logFactory);
-            _heartbeatDispatcher = new HeartbeatDispatcher(dynamoClient, _lockTracker, tableName, logFactory);
-        }
+            EnsureRunning();
 
-        public DynamoDbLockManager(AWSCredentials credentials, AmazonDynamoDBConfig config, string tableName, ILockTableProvisioner provisioner, IHeartbeatDispatcher heartbeatDispatcher, ILocalLockTracker lockTracker, ILoggerFactory logFactory, long defaultLeaseTime, TimeSpan hearbeat)
-            : this(credentials, config, tableName, provisioner, heartbeatDispatcher, lockTracker, logFactory)
-        {
-            _defaultLeaseTime = defaultLeaseTime;
-            _heartbeat = hearbeat;
-        }
-
-        public async Task<bool> AcquireLock(string Id)
-        {
             try
             {
+                var now = DateTimeOffset.UtcNow;
                 var req = new PutItemRequest()
                 {
-                    TableName = _tableName,
-                    Item = new Dictionary<string, AttributeValue>
-                    {
-                        { "id", new AttributeValue(Id) },
-                        { "lock_owner", new AttributeValue(_nodeId) },
-                        {
-                            "expires", new AttributeValue()
-                            {
-                                N = Convert.ToString(new DateTimeOffset(DateTime.UtcNow).ToUnixTimeSeconds() + _defaultLeaseTime)
-                            }
-                        },
-                        {
-                            "purge_time", new AttributeValue()
-                            {
-                                N = Convert.ToString(new DateTimeOffset(DateTime.UtcNow).ToUnixTimeSeconds() + (_defaultLeaseTime * 10))
-                            }
-                        }
-                    },
+                    TableName = _options.TableName,
+                    Item = LockItemHelper.CreateLockItem(now, lockId, _options),
                     ConditionExpression = "attribute_not_exists(id) OR (expires < :expired)",
                     ExpressionAttributeValues = new Dictionary<string, AttributeValue>
                     {
                         { ":expired", new AttributeValue()
                             {
-                                N = Convert.ToString(new DateTimeOffset(DateTime.UtcNow).ToUnixTimeSeconds() + _jitterTolerance)
+                                N = (now + _options.JitterTolerance).ToUnixTimeSeconds().ToString(),
                             }
                         }
                     }
                 };
+                var response = await _client.PutItemAsync(req, cancellation);
 
-                var response = await _client.PutItemAsync(req);
-
-                if (response.HttpStatusCode == System.Net.HttpStatusCode.OK)
+                if (response.HttpStatusCode != HttpStatusCode.OK)
                 {
-                    _lockTracker.Add(Id);
-                    return true;
+                    throw new InvalidOperationException($"Unexpected status code from DynamoDB: {(int)response.HttpStatusCode}");
                 }
+
+                var lockCts = new CancellationTokenSource();
+                var lockItem = new LocalLock(lockId, () => lockCts.Cancel());
+                _lockTracker.Add(lockItem);
+                return DistributedLockAcquisition.CreateAcquired(lockCts, releaseCancellation => ReleaseLockAsync(lockId, releaseCancellation));
             }
             catch (ConditionalCheckFailedException)
             {
+                return DistributedLockAcquisition.CreateLost();
             }
-            return false;
         }
 
-        public async Task ReleaseLock(string Id)
+        private async Task ReleaseLockAsync(string lockId, CancellationToken cancellation)
         {
-            _lockTracker.Remove(Id);
-        
+            EnsureRunning();
+
+            if (!_lockTracker.Remove(lockId))
+            {
+                return;
+            }
+
             try
             {
                 var req = new DeleteItemRequest()
                 {
-                    TableName = _tableName,
+                    TableName = _options.TableName,
                     Key = new Dictionary<string, AttributeValue>
                     {
-                        { "id", new AttributeValue(Id) }
+                        { "id", new AttributeValue(lockId) }
                     },
                     ConditionExpression = "lock_owner = :node_id",
                     ExpressionAttributeValues = new Dictionary<string, AttributeValue>
                     {
-                        { ":node_id", new AttributeValue(_nodeId) }
+                        { ":node_id", new AttributeValue(_options.NodeId) }
                     }
 
                 };
-                await _client.DeleteItemAsync(req);
+                await _client.DeleteItemAsync(req, cancellation);
             }
             catch (ConditionalCheckFailedException)
             {
             }
         }
 
-        public async Task Start()
+        public async Task ExecuteAsync(CancellationToken cancellation)
         {
-            await _provisioner.Provision();
-            _heartbeatDispatcher.Start(_nodeId, _heartbeat, _defaultLeaseTime);
+            if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+            {
+                throw new InvalidOperationException($"{nameof(DynamoDbLockManager)} is already running");
+            }
+
+            try
+            {
+                // Init...
+                await _provisioner.ProvisionAsync(cancellation);
+
+                // Run heartbeat task in the background
+                await _heartbeatDispatcher.ExecuteAsync(() => _lockTracker.GetSnapshot(), cancellation);
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                return;
+            }
+            finally
+            {
+                try
+                {
+                    foreach (var lockItem in _lockTracker.GetSnapshot())
+                    {
+                        try
+                        {
+                            lockItem.OnLost();
+                        }
+                        catch { }
+                    }
+
+                    _lockTracker.Clear();
+                }
+                catch { }
+
+                Volatile.Write(ref _running, 0);
+            }
         }
 
-        public Task Stop()
+        private void EnsureRunning()
         {
-            _heartbeatDispatcher.Stop();
-            _lockTracker.Clear();
-            return Task.CompletedTask;
+            if (Volatile.Read(ref _running) == 0)
+            {
+                throw new InvalidOperationException($"{nameof(DynamoDbLockManager)} isn't started");
+            }
         }
     }
 }

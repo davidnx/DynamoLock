@@ -1,13 +1,12 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+﻿using System.Collections.Generic;
+using System;
+using System.Threading.Tasks;
 using System.Threading;
 
 namespace DynamoLock
 {
     public interface IHeartbeatDispatcher
     {
-        void Start(string nodeId, TimeSpan heartbeat, long leaseTime);
-        void Stop();
+        Task ExecuteAsync(Func<ICollection<LocalLock>> getSnapshotFunc, CancellationToken cancellation);
     }
 }

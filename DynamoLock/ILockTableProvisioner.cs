@@ -1,9 +1,10 @@
-﻿using System.Threading.Tasks;
+﻿using System.Threading;
+using System.Threading.Tasks;
 
 namespace DynamoLock
 {
     public interface ILockTableProvisioner
     {
-        Task Provision();
+        Task ProvisionAsync(CancellationToken cancellation);
     }
 }
