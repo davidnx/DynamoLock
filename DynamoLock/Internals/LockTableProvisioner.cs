@@ -35,13 +35,15 @@ namespace DynamoLock.Internals
                     if (table.Table.TableStatus == TableStatus.ACTIVE)
                     {
                         _logger.LogInformation($"Lock table {_options.TableName} already exists, all good");
-                        return;
                     }
                     else if (table.Table.TableStatus == TableStatus.CREATING)
                     {
                         await WaitForTableActivation(cancellation);
                     }
-
+                    else
+                    {
+                        _logger.LogWarning($"Lock table {_options.TableName} is in unexpected state {table.Table.TableStatus.Value}. Proceeding anyway, but this could be a problem");
+                    }
                 }
                 catch (ResourceNotFoundException)
                 {
